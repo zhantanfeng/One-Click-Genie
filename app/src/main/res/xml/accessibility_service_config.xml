@@ -1,0 +1,8 @@
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeTouchInteractionStart|typeTouchInteractionEnd|typeWindowStateChanged"
+    android:accessibilityFlags="flagRequestTouchExplorationMode|flagSendMotionEvents"
+    android:canPerformGestures="true"
+    android:canRequestTouchExplorationMode="true"
+    android:canRetrieveWindowContent="false"
+    android:description="@string/accessibility_service_description"
+    android:notificationTimeout="0" />

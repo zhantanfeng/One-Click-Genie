@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">操作轨迹</string>
+    <string name="accessibility_service_description">用于记录和回放屏幕触摸轨迹。</string>
+</resources>

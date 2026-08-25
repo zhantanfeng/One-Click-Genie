@@ -1,0 +1,301 @@
+package com.example.gesturereplay
+
+import android.accessibilityservice.AccessibilityGestureEvent
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
+import android.accessibilityservice.TouchInteractionController
+import android.graphics.Color
+import android.graphics.Path
+import android.graphics.PixelFormat
+import android.graphics.drawable.GradientDrawable
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.util.Log
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.WindowManager
+import android.view.accessibility.AccessibilityEvent
+import android.widget.TextView
+import java.util.concurrent.Executor
+import kotlin.math.max
+
+class GestureAccessibilityService : AccessibilityService() {
+    private val handler = Handler(Looper.getMainLooper())
+    private val mainExecutor = Executor { command -> handler.post(command) }
+    private val recordedGestures = mutableListOf<RecordedGesture>()
+    private var recordingName = ""
+    private var recordingStartMs = 0L
+    private var recordingWidth = 0
+    private var recordingHeight = 0
+    private var recordingOrientation = 0
+    private var recording = false
+    private var receivedFirstGesture = false
+    private var overlay: TextView? = null
+    private var touchController: TouchInteractionController? = null
+
+    private val finishRecordingRunnable = Runnable { finishRecording() }
+    private val countdownRunnable = object : Runnable {
+        override fun run() {
+            if (!recording || !receivedFirstGesture) return
+            val finishAt = lastGestureFinishedAt + IDLE_TIMEOUT_MS
+            val remaining = (finishAt - SystemClock.uptimeMillis()).coerceAtLeast(0L)
+            GestureController.onRecordingCountdown(remaining)
+            updateOverlay("正在记录 · %.1f 秒后结束".format(remaining / 1000f))
+            if (remaining > 0L) handler.postDelayed(this, 100L)
+        }
+    }
+    private var lastGestureFinishedAt = 0L
+
+    private val touchCallback = object : TouchInteractionController.Callback {
+        override fun onMotionEvent(event: MotionEvent) {
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                touchController?.requestDelegating()
+            }
+        }
+
+        override fun onStateChanged(state: Int) = Unit
+    }
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        instance = this
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            touchController = getTouchInteractionController(0).also {
+                it.registerCallback(mainExecutor, touchCallback)
+            }
+        }
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
+
+    override fun onInterrupt() = Unit
+
+    override fun onDestroy() {
+        stopTimers()
+        removeOverlay()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            touchController?.unregisterCallback(touchCallback)
+        }
+        if (instance === this) instance = null
+        super.onDestroy()
+    }
+
+    override fun onGesture(gestureEvent: AccessibilityGestureEvent): Boolean {
+        if (!recording || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
+        val events = gestureEvent.motionEvents
+        if (events.isEmpty()) return false
+        recordGesture(events)
+        return false
+    }
+
+    fun startRecording(name: String) {
+        stopTimers()
+        recordedGestures.clear()
+        recordingName = name
+        val bounds = currentScreenBounds()
+        recordingWidth = bounds.first
+        recordingHeight = bounds.second
+        recordingOrientation = GestureController.currentOrientation()
+        recordingStartMs = SystemClock.uptimeMillis()
+        recording = true
+        receivedFirstGesture = false
+        showOverlay("正在记录 · 等待首次操作")
+        handler.postDelayed(finishRecordingRunnable, INITIAL_GRACE_MS)
+    }
+
+    private fun recordGesture(events: List<MotionEvent>) {
+        if (!recording) return
+        if (events.first().downTime < recordingStartMs) return
+        if (!receivedFirstGesture) {
+            receivedFirstGesture = true
+            handler.removeCallbacks(finishRecordingRunnable)
+            GestureController.onRecordingActive()
+        }
+        val gesture = events.toRecordedGesture(
+            recordingStartMs = recordingStartMs,
+            screenWidth = recordingWidth,
+            screenHeight = recordingHeight
+        )
+        if (gesture.samples.isNotEmpty()) recordedGestures += gesture
+        lastGestureFinishedAt = SystemClock.uptimeMillis()
+        handler.removeCallbacks(finishRecordingRunnable)
+        handler.removeCallbacks(countdownRunnable)
+        handler.post(countdownRunnable)
+        handler.postDelayed(finishRecordingRunnable, IDLE_TIMEOUT_MS)
+    }
+
+    private fun finishRecording() {
+        if (!recording) return
+        recording = false
+        stopTimers()
+        removeOverlay()
+        GestureController.onRecordingFinished(
+            RecordingDraft(
+                name = recordingName,
+                screenWidth = recordingWidth,
+                screenHeight = recordingHeight,
+                orientation = recordingOrientation,
+                gestures = recordedGestures.toList()
+            )
+        )
+    }
+
+    fun playAfterCountdown(record: GestureRecord) {
+        stopTimers()
+        showOverlay("3 秒后执行")
+        val startedAt = SystemClock.uptimeMillis()
+        val ticker = object : Runnable {
+            override fun run() {
+                val elapsed = SystemClock.uptimeMillis() - startedAt
+                val remaining = (PLAYBACK_COUNTDOWN_MS - elapsed).coerceAtLeast(0L)
+                GestureController.onPlaybackCountdown(remaining)
+                updateOverlay("%.1f 秒后执行".format(remaining / 1000f))
+                if (remaining > 0L) {
+                    handler.postDelayed(this, 100L)
+                } else {
+                    GestureController.onPlaybackStarted()
+                    updateOverlay("正在执行")
+                    playGestureAt(record, 0, 0L)
+                }
+            }
+        }
+        handler.post(ticker)
+    }
+
+    private fun playGestureAt(record: GestureRecord, index: Int, previousEndMs: Long) {
+        if (index >= record.gestures.size) {
+            removeOverlay()
+            GestureController.onPlaybackFinished(true)
+            return
+        }
+        val source = record.gestures[index]
+        val delay = (source.startOffsetMs - previousEndMs).coerceAtLeast(0L)
+        handler.postDelayed({
+            val gesture = buildGesture(source)
+            if (gesture == null) {
+                removeOverlay()
+                GestureController.onPlaybackFinished(false)
+                return@postDelayed
+            }
+            val accepted = dispatchGesture(
+                gesture,
+                object : GestureResultCallback() {
+                    override fun onCompleted(gestureDescription: GestureDescription?) {
+                        playGestureAt(
+                            record = record,
+                            index = index + 1,
+                            previousEndMs = source.startOffsetMs + source.durationMs
+                        )
+                    }
+
+                    override fun onCancelled(gestureDescription: GestureDescription?) {
+                        removeOverlay()
+                        GestureController.onPlaybackFinished(false)
+                    }
+                },
+                handler
+            )
+            if (!accepted) {
+                removeOverlay()
+                GestureController.onPlaybackFinished(false)
+            }
+        }, delay)
+    }
+
+    private fun buildGesture(source: RecordedGesture): GestureDescription? {
+        val bounds = currentScreenBounds()
+        val width = bounds.first.toFloat()
+        val height = bounds.second.toFloat()
+        val grouped = source.samples.groupBy { it.pointerId }
+        if (grouped.isEmpty()) return null
+        val builder = GestureDescription.Builder()
+        grouped.values.take(GestureDescription.getMaxStrokeCount()).forEach { pointerSamples ->
+            val ordered = pointerSamples.sortedBy { it.offsetMs }
+            val first = ordered.first()
+            val startMs = first.offsetMs.coerceAtLeast(0L)
+            val endMs = ordered.last().offsetMs
+            val duration = max(1L, endMs - startMs).coerceAtMost(GestureDescription.getMaxGestureDuration())
+            val path = Path().apply {
+                moveTo(first.xRatio * width, first.yRatio * height)
+                ordered.drop(1).forEach { point ->
+                    lineTo(point.xRatio * width, point.yRatio * height)
+                }
+                if (ordered.size == 1) {
+                    lineTo(first.xRatio * width + 0.1f, first.yRatio * height + 0.1f)
+                }
+            }
+            builder.addStroke(GestureDescription.StrokeDescription(path, startMs, duration))
+        }
+        return runCatching { builder.build() }
+            .onFailure { Log.e(TAG, "Unable to build gesture", it) }
+            .getOrNull()
+    }
+
+    private fun currentScreenBounds(): Pair<Int, Int> {
+        val manager = getSystemService(WINDOW_SERVICE) as WindowManager
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = manager.currentWindowMetrics.bounds
+            bounds.width() to bounds.height()
+        } else {
+            @Suppress("DEPRECATION")
+            resources.displayMetrics.let { it.widthPixels to it.heightPixels }
+        }
+    }
+
+    private fun showOverlay(text: String) {
+        removeOverlay()
+        val view = TextView(this).apply {
+            this.text = text
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            setPadding(28, 14, 28, 14)
+            background = GradientDrawable().apply {
+                setColor(0xE6262C36.toInt())
+                cornerRadius = 18f
+            }
+        }
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            y = 80
+        }
+        (getSystemService(WINDOW_SERVICE) as WindowManager).addView(view, params)
+        overlay = view
+    }
+
+    private fun updateOverlay(text: String) {
+        overlay?.text = text
+    }
+
+    private fun removeOverlay() {
+        overlay?.let { view ->
+            runCatching { (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(view) }
+        }
+        overlay = null
+    }
+
+    private fun stopTimers() {
+        handler.removeCallbacks(finishRecordingRunnable)
+        handler.removeCallbacks(countdownRunnable)
+    }
+
+    companion object {
+        @Volatile
+        var instance: GestureAccessibilityService? = null
+            private set
+
+        private const val TAG = "GestureReplayService"
+        private const val INITIAL_GRACE_MS = 10_000L
+        private const val IDLE_TIMEOUT_MS = 3_000L
+        private const val PLAYBACK_COUNTDOWN_MS = 3_000L
+    }
+}
