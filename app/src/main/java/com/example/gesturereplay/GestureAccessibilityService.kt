@@ -58,6 +58,8 @@ class GestureAccessibilityService : AccessibilityService() {
         if (event.packageName?.toString() == packageName) return
 
         when (event.eventType) {
+            AccessibilityEvent.TYPE_TOUCH_INTERACTION_START -> markInteractionStarted()
+            AccessibilityEvent.TYPE_TOUCH_INTERACTION_END -> markInteractionFinished()
             AccessibilityEvent.TYPE_VIEW_CLICKED,
             AccessibilityEvent.TYPE_VIEW_LONG_CLICKED -> recordSemanticClick(event)
             AccessibilityEvent.TYPE_VIEW_SCROLLED -> recordSemanticScroll(event)
@@ -95,17 +97,12 @@ class GestureAccessibilityService : AccessibilityService() {
         receivedFirstGesture = false
         showOverlay("正在记录 · 等待首次操作")
         Log.i(TAG, "Recording started: $name, screen=${recordingWidth}x$recordingHeight")
-        handler.postDelayed(finishRecordingRunnable, INITIAL_GRACE_MS)
     }
 
     private fun recordGesture(events: List<MotionEvent>) {
         if (!recording) return
         if (events.first().downTime < recordingStartMs) return
-        if (!receivedFirstGesture) {
-            receivedFirstGesture = true
-            handler.removeCallbacks(finishRecordingRunnable)
-            GestureController.onRecordingActive()
-        }
+        markInteractionStarted()
         val gesture = events.toRecordedGesture(
             recordingStartMs = recordingStartMs,
             screenWidth = recordingWidth,
@@ -114,11 +111,7 @@ class GestureAccessibilityService : AccessibilityService() {
         if (gesture.samples.isNotEmpty()) recordedGestures += gesture
         lastRawGestureAt = SystemClock.uptimeMillis()
         Log.d(TAG, "Gesture captured: samples=${gesture.samples.size}, duration=${gesture.durationMs}ms")
-        lastGestureFinishedAt = SystemClock.uptimeMillis()
-        handler.removeCallbacks(finishRecordingRunnable)
-        handler.removeCallbacks(countdownRunnable)
-        handler.post(countdownRunnable)
-        handler.postDelayed(finishRecordingRunnable, IDLE_TIMEOUT_MS)
+        markInteractionFinished()
     }
 
     private fun recordSemanticClick(event: AccessibilityEvent) {
@@ -184,11 +177,7 @@ class GestureAccessibilityService : AccessibilityService() {
         direction: GestureDirection? = null
     ) {
         if (points.isEmpty()) return
-        if (!receivedFirstGesture) {
-            receivedFirstGesture = true
-            handler.removeCallbacks(finishRecordingRunnable)
-            GestureController.onRecordingActive()
-        }
+        markInteractionStarted()
         val samples = buildList {
             points.forEachIndexed { index, (x, y) ->
                 val offset = if (points.size == 1) 0L else durationMs * index / (points.size - 1)
@@ -229,12 +218,27 @@ class GestureAccessibilityService : AccessibilityService() {
             samples = samples,
             direction = direction ?: samples.toDirection()
         )
+        markInteractionFinished()
+        Log.d(TAG, "Semantic gesture captured: points=${points.size}")
+    }
+
+    private fun markInteractionStarted() {
+        if (!receivedFirstGesture) {
+            receivedFirstGesture = true
+            GestureController.onRecordingActive()
+        }
+        handler.removeCallbacks(finishRecordingRunnable)
+        handler.removeCallbacks(countdownRunnable)
+        updateOverlay("正在记录")
+    }
+
+    private fun markInteractionFinished() {
+        if (!recording || !receivedFirstGesture) return
         lastGestureFinishedAt = SystemClock.uptimeMillis()
         handler.removeCallbacks(finishRecordingRunnable)
         handler.removeCallbacks(countdownRunnable)
         handler.post(countdownRunnable)
         handler.postDelayed(finishRecordingRunnable, IDLE_TIMEOUT_MS)
-        Log.d(TAG, "Semantic gesture captured: points=${points.size}")
     }
 
     private fun finishRecording() {
@@ -406,7 +410,6 @@ class GestureAccessibilityService : AccessibilityService() {
             private set
 
         private const val TAG = "GestureReplayService"
-        private const val INITIAL_GRACE_MS = 10_000L
         private const val IDLE_TIMEOUT_MS = 5_000L
         private const val PLAYBACK_COUNTDOWN_MS = 3_000L
         private const val RAW_GESTURE_GRACE_MS = 500L
