@@ -1,0 +1,4 @@
+﻿[2026-08-26 00:24:25] Waiting for an authorized Android device.
+[2026-08-26 23:00:51] Waiting for an authorized Android device.
+[2026-08-26 23:04:30] Authorized device detected: 882da5fe               device product:umi model:Mi_10 device:umi transport_id:1
+[2026-08-26 23:04:31] FAILED: adb.exe: failed to install D:\One-Click-Genie\app\build\outputs\apk\debug\app-debug.apk: Failure [INSTALL_FAILED_USER_RESTRICTED: Install canceled by user]

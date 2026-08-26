@@ -29,8 +29,14 @@ class GestureAccessibilityService : AccessibilityService() {
     private var recordingHeight = 0
     private var recordingOrientation = 0
     private var recording = false
+    private var recordingInputReadyAtMs = 0L
+    private var activeWindowPackageName: String? = null
+    private var homePackageName: String? = null
+    private var ignoreHomeTransitionUntilMs = 0L
     private var receivedFirstGesture = false
     private var overlay: TextView? = null
+    private var pendingHomeAction: Runnable? = null
+    private val removePlaybackResultRunnable = Runnable { removeOverlay() }
 
     private val finishRecordingRunnable = Runnable { finishRecording() }
     private val countdownRunnable = object : Runnable {
@@ -44,7 +50,7 @@ class GestureAccessibilityService : AccessibilityService() {
         }
     }
     private var lastGestureFinishedAt = 0L
-    private var lastRawGestureAt = 0L
+    private var lastRawGestureEventTime = Long.MIN_VALUE
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -54,12 +60,18 @@ class GestureAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        val eventPackageName = event?.packageName?.toString()
+        if (eventPackageName != null) activeWindowPackageName = eventPackageName
         if (!recording || event == null || event.eventTime < recordingStartMs) return
         if (event.packageName?.toString() == packageName) return
 
         when (event.eventType) {
-            AccessibilityEvent.TYPE_TOUCH_INTERACTION_START -> markInteractionStarted()
-            AccessibilityEvent.TYPE_TOUCH_INTERACTION_END -> markInteractionFinished()
+            AccessibilityEvent.TYPE_TOUCH_INTERACTION_START -> {
+                if (!isHomeTransitionEvent(eventPackageName)) markInteractionStarted()
+            }
+            AccessibilityEvent.TYPE_TOUCH_INTERACTION_END -> {
+                if (!isHomeTransitionEvent(eventPackageName)) markInteractionFinished()
+            }
             AccessibilityEvent.TYPE_VIEW_CLICKED,
             AccessibilityEvent.TYPE_VIEW_LONG_CLICKED -> recordSemanticClick(event)
             AccessibilityEvent.TYPE_VIEW_SCROLLED -> recordSemanticScroll(event)
@@ -86,6 +98,12 @@ class GestureAccessibilityService : AccessibilityService() {
 
     fun startRecording(name: String) {
         stopTimers()
+        recording = false
+        removeOverlay()
+        returnHomeThen { beginRecording(name) }
+    }
+
+    private fun beginRecording(name: String) {
         recordedGestures.clear()
         recordingName = name
         val bounds = currentScreenBounds()
@@ -93,6 +111,10 @@ class GestureAccessibilityService : AccessibilityService() {
         recordingHeight = bounds.second
         recordingOrientation = GestureController.currentOrientation()
         recordingStartMs = SystemClock.uptimeMillis()
+        recordingInputReadyAtMs = recordingStartMs
+        lastRawGestureEventTime = Long.MIN_VALUE
+        homePackageName = rootInActiveWindow?.packageName?.toString() ?: activeWindowPackageName
+        ignoreHomeTransitionUntilMs = recordingStartMs + HOME_TRANSITION_FILTER_MS
         recording = true
         receivedFirstGesture = false
         showOverlay("正在记录 · 等待首次操作")
@@ -101,21 +123,22 @@ class GestureAccessibilityService : AccessibilityService() {
 
     private fun recordGesture(events: List<MotionEvent>) {
         if (!recording) return
-        if (events.first().downTime < recordingStartMs) return
-        markInteractionStarted()
+        if (events.first().downTime < recordingInputReadyAtMs) return
         val gesture = events.toRecordedGesture(
             recordingStartMs = recordingStartMs,
             screenWidth = recordingWidth,
             screenHeight = recordingHeight
         )
+        if (shouldIgnoreHomeTransitionGesture(gesture)) return
+        markInteractionStarted()
         if (gesture.samples.isNotEmpty()) recordedGestures += gesture
-        lastRawGestureAt = SystemClock.uptimeMillis()
+        lastRawGestureEventTime = events.last().eventTime
         Log.d(TAG, "Gesture captured: samples=${gesture.samples.size}, duration=${gesture.durationMs}ms")
         markInteractionFinished()
     }
 
     private fun recordSemanticClick(event: AccessibilityEvent) {
-        if (shouldIgnoreSemanticEvent()) return
+        if (shouldIgnoreSemanticEvent(event.eventTime)) return
         val bounds = Rect()
         val node = event.source ?: return
         node.getBoundsInScreen(bounds)
@@ -131,7 +154,7 @@ class GestureAccessibilityService : AccessibilityService() {
     }
 
     private fun recordSemanticScroll(event: AccessibilityEvent) {
-        if (shouldIgnoreSemanticEvent()) return
+        if (shouldIgnoreSemanticEvent(event.eventTime)) return
         val bounds = Rect()
         val node = event.source ?: return
         node.getBoundsInScreen(bounds)
@@ -148,6 +171,9 @@ class GestureAccessibilityService : AccessibilityService() {
             if (direction < 0) GestureDirection.LEFT else GestureDirection.RIGHT
         } else {
             if (direction < 0) GestureDirection.UP else GestureDirection.DOWN
+        }
+        if (gestureDirection == GestureDirection.RIGHT && isHomeTransitionEvent(event.packageName?.toString())) {
+            return
         }
         val start = if (horizontalScroll) {
             (centerX - direction * distance) to centerY
@@ -167,8 +193,18 @@ class GestureAccessibilityService : AccessibilityService() {
         )
     }
 
-    private fun shouldIgnoreSemanticEvent(): Boolean =
-        SystemClock.uptimeMillis() - lastRawGestureAt < RAW_GESTURE_GRACE_MS
+    private fun shouldIgnoreSemanticEvent(eventTime: Long): Boolean =
+        lastRawGestureEventTime != Long.MIN_VALUE &&
+            kotlin.math.abs(eventTime - lastRawGestureEventTime) <= RAW_GESTURE_GRACE_MS
+
+    private fun shouldIgnoreHomeTransitionGesture(gesture: RecordedGesture): Boolean =
+        gesture.direction == GestureDirection.RIGHT && isHomeTransitionEvent(
+            rootInActiveWindow?.packageName?.toString() ?: activeWindowPackageName
+        )
+
+    private fun isHomeTransitionEvent(eventPackageName: String?): Boolean =
+        SystemClock.uptimeMillis() < ignoreHomeTransitionUntilMs &&
+            homePackageName != null && eventPackageName == homePackageName
 
     private fun recordSyntheticGesture(
         startMs: Long,
@@ -225,6 +261,7 @@ class GestureAccessibilityService : AccessibilityService() {
     private fun markInteractionStarted() {
         if (!receivedFirstGesture) {
             receivedFirstGesture = true
+            ignoreHomeTransitionUntilMs = 0L
             GestureController.onRecordingActive()
         }
         handler.removeCallbacks(finishRecordingRunnable)
@@ -260,6 +297,11 @@ class GestureAccessibilityService : AccessibilityService() {
 
     fun playAfterCountdown(record: GestureRecord) {
         stopTimers()
+        removeOverlay()
+        returnHomeThen { startPlaybackCountdown(record) }
+    }
+
+    private fun startPlaybackCountdown(record: GestureRecord) {
         showOverlay("3 秒后执行")
         val startedAt = SystemClock.uptimeMillis()
         val ticker = object : Runnable {
@@ -282,8 +324,7 @@ class GestureAccessibilityService : AccessibilityService() {
 
     private fun playGestureAt(record: GestureRecord, index: Int, previousEndMs: Long) {
         if (index >= record.gestures.size) {
-            removeOverlay()
-            GestureController.onPlaybackFinished(true)
+            finishPlayback(true)
             return
         }
         val source = record.gestures[index]
@@ -291,8 +332,7 @@ class GestureAccessibilityService : AccessibilityService() {
         handler.postDelayed({
             val gesture = buildGesture(source)
             if (gesture == null) {
-                removeOverlay()
-                GestureController.onPlaybackFinished(false)
+                finishPlayback(false)
                 return@postDelayed
             }
             val accepted = dispatchGesture(
@@ -307,17 +347,22 @@ class GestureAccessibilityService : AccessibilityService() {
                     }
 
                     override fun onCancelled(gestureDescription: GestureDescription?) {
-                        removeOverlay()
-                        GestureController.onPlaybackFinished(false)
+                        finishPlayback(false)
                     }
                 },
                 handler
             )
             if (!accepted) {
-                removeOverlay()
-                GestureController.onPlaybackFinished(false)
+                finishPlayback(false)
             }
         }, delay)
+    }
+
+    private fun finishPlayback(success: Boolean) {
+        showOverlay(if (success) "执行完成" else "执行已中断")
+        GestureController.onPlaybackFinished(success)
+        handler.removeCallbacks(removePlaybackResultRunnable)
+        handler.postDelayed(removePlaybackResultRunnable, PLAYBACK_RESULT_DISPLAY_MS)
     }
 
     private fun buildGesture(source: RecordedGesture): GestureDescription? {
@@ -402,6 +447,32 @@ class GestureAccessibilityService : AccessibilityService() {
     private fun stopTimers() {
         handler.removeCallbacks(finishRecordingRunnable)
         handler.removeCallbacks(countdownRunnable)
+        handler.removeCallbacks(removePlaybackResultRunnable)
+        pendingHomeAction?.let(handler::removeCallbacks)
+        pendingHomeAction = null
+    }
+
+    private fun returnHomeThen(action: () -> Unit) {
+        if (!performGlobalAction(GLOBAL_ACTION_HOME)) {
+            Log.w(TAG, "Unable to perform HOME before gesture operation")
+        }
+        var homePresses = 1
+        val callback = object : Runnable {
+            override fun run() {
+                if (homePresses < HOME_PRESS_COUNT) {
+                    homePresses++
+                    if (!performGlobalAction(GLOBAL_ACTION_HOME)) {
+                        Log.w(TAG, "Unable to perform HOME before gesture operation")
+                    }
+                    handler.postDelayed(this, HOME_TRANSITION_DELAY_MS)
+                    return
+                }
+                pendingHomeAction = null
+                action()
+            }
+        }
+        pendingHomeAction = callback
+        handler.postDelayed(callback, HOME_TRANSITION_DELAY_MS)
     }
 
     companion object {
@@ -410,8 +481,12 @@ class GestureAccessibilityService : AccessibilityService() {
             private set
 
         private const val TAG = "GestureReplayService"
-        private const val IDLE_TIMEOUT_MS = 5_000L
+        private const val IDLE_TIMEOUT_MS = 10_000L
         private const val PLAYBACK_COUNTDOWN_MS = 3_000L
-        private const val RAW_GESTURE_GRACE_MS = 500L
+        private const val PLAYBACK_RESULT_DISPLAY_MS = 1_500L
+        private const val HOME_TRANSITION_DELAY_MS = 400L
+        private const val HOME_TRANSITION_FILTER_MS = 1_000L
+        private const val HOME_PRESS_COUNT = 2
+        private const val RAW_GESTURE_GRACE_MS = 80L
     }
 }
