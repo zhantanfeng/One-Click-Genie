@@ -17,8 +17,16 @@ data class TouchSample(
 data class RecordedGesture(
     val startOffsetMs: Long,
     val durationMs: Long,
-    val samples: List<TouchSample>
+    val samples: List<TouchSample>,
+    val direction: GestureDirection? = null
 )
+
+enum class GestureDirection {
+    LEFT,
+    RIGHT,
+    UP,
+    DOWN
+}
 
 data class GestureRecord(
     val id: Long,
@@ -53,6 +61,7 @@ enum class EngineState {
 
 data class AppState(
     val records: List<GestureRecord> = emptyList(),
+    val serviceConnected: Boolean = false,
     val engineState: EngineState = EngineState.IDLE,
     val draft: RecordingDraft? = null,
     val countdownMs: Long? = null,
@@ -111,8 +120,23 @@ internal fun List<MotionEvent>.toRecordedGesture(
     return RecordedGesture(
         startOffsetMs = (gestureStart - recordingStartMs).coerceAtLeast(0L),
         durationMs = (last().eventTime - gestureStart).coerceAtLeast(1L),
-        samples = samples
+        samples = samples,
+        direction = samples.toDirection()
     )
+}
+
+internal fun List<TouchSample>.toDirection(): GestureDirection? {
+    if (size < 2) return null
+    val first = first()
+    val last = last()
+    val dx = last.x - first.x
+    val dy = last.y - first.y
+    if (kotlin.math.abs(dx) < 24f && kotlin.math.abs(dy) < 24f) return null
+    return if (kotlin.math.abs(dx) >= kotlin.math.abs(dy)) {
+        if (dx < 0) GestureDirection.LEFT else GestureDirection.RIGHT
+    } else {
+        if (dy < 0) GestureDirection.UP else GestureDirection.DOWN
+    }
 }
 
 internal fun GestureRecord.toJson(): JSONObject = JSONObject().apply {
@@ -129,6 +153,7 @@ internal fun GestureRecord.toJson(): JSONObject = JSONObject().apply {
 private fun RecordedGesture.toJson(): JSONObject = JSONObject().apply {
     put("startOffsetMs", startOffsetMs)
     put("durationMs", durationMs)
+    put("direction", direction?.name)
     put("samples", JSONArray().apply {
         samples.forEach { sample ->
             put(JSONObject().apply {
@@ -156,6 +181,11 @@ internal fun JSONObject.toGestureRecord(): GestureRecord = GestureRecord(
         RecordedGesture(
             startOffsetMs = gesture.getLong("startOffsetMs"),
             durationMs = gesture.getLong("durationMs"),
+            direction = if (gesture.has("direction") && !gesture.isNull("direction")) {
+                runCatching { GestureDirection.valueOf(gesture.getString("direction")) }.getOrNull()
+            } else {
+                null
+            },
             samples = gesture.getJSONArray("samples").mapObjects { sample ->
                 TouchSample(
                     pointerId = sample.getInt("pointerId"),

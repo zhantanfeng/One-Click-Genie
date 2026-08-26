@@ -1,6 +1,5 @@
 package com.example.gesturereplay
 
-import android.app.Activity
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -71,7 +70,6 @@ private fun GestureReplayApp() {
     var selectedRecordId by remember { mutableStateOf<Long?>(null) }
     val selectedRecord = state.records.firstOrNull { it.id == selectedRecordId }
     val draft = state.draft
-    val activity = LocalContext.current as? Activity
 
     MaterialTheme(
         colorScheme = MaterialTheme.colorScheme.copy(
@@ -95,12 +93,10 @@ private fun GestureReplayApp() {
                     onBack = { selectedRecordId = null },
                     onPlay = {
                         GestureController.play(selectedRecord)
-                        activity?.moveTaskToBack(true)
                     },
                     onRerecord = {
                         if (GestureController.startRecording(selectedRecord.name, selectedRecord.id)) {
                             selectedRecordId = null
-                            activity?.moveTaskToBack(true)
                         }
                     },
                     onRename = { GestureController.renameRecord(selectedRecord.id, it) },
@@ -124,7 +120,6 @@ private fun GestureReplayApp() {
 @Composable
 private fun RecordList(state: AppState, onOpen: (GestureRecord) -> Unit) {
     var naming by remember { mutableStateOf(false) }
-    val activity = LocalContext.current as? Activity
 
     Scaffold(
         containerColor = Background,
@@ -146,6 +141,7 @@ private fun RecordList(state: AppState, onOpen: (GestureRecord) -> Unit) {
                 .fillMaxSize()
                 .padding(padding)
         ) {
+            ServiceStatusBanner(connected = state.serviceConnected)
             state.message?.let { message ->
                 Text(
                     text = message,
@@ -173,7 +169,6 @@ private fun RecordList(state: AppState, onOpen: (GestureRecord) -> Unit) {
                             onOpen = { onOpen(record) },
                             onPlay = {
                                 GestureController.play(record)
-                                activity?.moveTaskToBack(true)
                             }
                         )
                         if (record != state.records.last()) HorizontalDivider(color = Border)
@@ -190,12 +185,37 @@ private fun RecordList(state: AppState, onOpen: (GestureRecord) -> Unit) {
             initialName = "",
             onDismiss = { naming = false },
             onConfirm = { name ->
-                naming = false
                 if (GestureController.startRecording(name.ifBlank { "未命名" })) {
-                    activity?.moveTaskToBack(true)
+                    naming = false
                 }
             }
         )
+    }
+}
+
+@Composable
+private fun ServiceStatusBanner(connected: Boolean) {
+    val context = LocalContext.current
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(if (connected) Color(0xFFEAF7EE) else Color(0xFFFFF4E5))
+            .padding(horizontal = 20.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = if (connected) "录制服务已连接" else "请先开启操作轨迹服务",
+            color = if (connected) Color(0xFF18794E) else Color(0xFF9A6700),
+            modifier = Modifier.weight(1f),
+            fontSize = 13.sp
+        )
+        if (!connected) {
+            TextButton(onClick = {
+                context.startActivity(android.content.Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            }) {
+                Text("去开启")
+            }
+        }
     }
 }
 
@@ -380,6 +400,7 @@ private fun GestureSummary(index: Int, gesture: RecordedGesture) {
     ) else 0.0
     val type = when {
         samples.map { it.pointerId }.distinct().size > 1 -> "多指"
+        gesture.direction != null -> directionLabel(gesture.direction)
         distance > 24 -> "滑动"
         gesture.durationMs >= 500 -> "长按"
         else -> "点击"
@@ -407,6 +428,13 @@ private fun GestureSummary(index: Int, gesture: RecordedGesture) {
     }
 }
 
+private fun directionLabel(direction: GestureDirection): String = when (direction) {
+    GestureDirection.LEFT -> "左划"
+    GestureDirection.RIGHT -> "右划"
+    GestureDirection.UP -> "上划"
+    GestureDirection.DOWN -> "下划"
+}
+
 @Composable
 private fun NameDialog(
     title: String,
@@ -416,20 +444,34 @@ private fun NameDialog(
     onConfirm: (String) -> Unit
 ) {
     var name by remember(initialName) { mutableStateOf(initialName) }
+    var nameError by remember { mutableStateOf(false) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
         text = {
             OutlinedTextField(
                 value = name,
-                onValueChange = { name = it },
+                onValueChange = {
+                    name = it
+                    nameError = false
+                },
                 label = { Text("名称") },
                 singleLine = true,
+                isError = nameError,
+                supportingText = if (nameError) {
+                    { Text("请输入名称") }
+                } else {
+                    null
+                },
                 modifier = Modifier.fillMaxWidth()
             )
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
-        confirmButton = { TextButton(onClick = { onConfirm(name) }) { Text(confirmLabel) } }
+        confirmButton = {
+            TextButton(onClick = {
+                if (name.isBlank()) nameError = true else onConfirm(name.trim())
+            }) { Text(confirmLabel) }
+        }
     )
 }
 

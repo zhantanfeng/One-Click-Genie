@@ -3,6 +3,7 @@ package com.example.gesturereplay
 import android.app.Application
 import android.content.Intent
 import android.content.res.Configuration
+import android.provider.Settings
 import android.os.SystemClock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -19,12 +20,23 @@ object GestureController {
         if (::application.isInitialized) return
         application = app
         repository = GestureRepository(app)
-        mutableState.value = AppState(records = repository.load())
+        mutableState.value = AppState(
+            records = repository.load(),
+            serviceConnected = GestureAccessibilityService.instance != null
+        )
+    }
+
+    fun onServiceConnected(connected: Boolean) {
+        mutableState.value = mutableState.value.copy(serviceConnected = connected)
     }
 
     fun startRecording(name: String, replaceRecordId: Long? = null): Boolean {
         val service = GestureAccessibilityService.instance ?: run {
-            showMessage("操作轨迹服务未运行")
+            application.startActivity(
+                Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                }
+            )
             return false
         }
         mutableState.value = mutableState.value.copy(
@@ -77,7 +89,11 @@ object GestureController {
         }
         replacementRecordId = null
         repository.save(records)
-        mutableState.value = AppState(records = records, message = "已保存")
+        mutableState.value = AppState(
+            records = records,
+            serviceConnected = GestureAccessibilityService.instance != null,
+            message = "已保存"
+        )
     }
 
     fun discardDraft() {
