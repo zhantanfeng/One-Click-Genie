@@ -4,7 +4,6 @@ import android.app.Application
 import android.content.Intent
 import android.content.res.Configuration
 import android.provider.Settings
-import android.os.SystemClock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -20,9 +19,12 @@ object GestureController {
         if (::application.isInitialized) return
         application = app
         repository = GestureRepository(app)
+        val draft = repository.loadDraft()
         mutableState.value = AppState(
             records = repository.load(),
-            serviceConnected = GestureAccessibilityService.instance != null
+            serviceConnected = GestureAccessibilityService.instance != null,
+            engineState = if (draft == null) EngineState.IDLE else EngineState.RECORDED_PREVIEW,
+            draft = draft
         )
     }
 
@@ -45,6 +47,7 @@ object GestureController {
             countdownMs = null,
             message = null
         )
+        repository.clearDraft()
         replacementRecordId = replaceRecordId
         service.startRecording(name)
         return true
@@ -59,6 +62,7 @@ object GestureController {
     }
 
     fun onRecordingFinished(draft: RecordingDraft) {
+        repository.saveDraft(draft)
         mutableState.value = mutableState.value.copy(
             engineState = EngineState.RECORDED_PREVIEW,
             draft = draft,
@@ -89,6 +93,7 @@ object GestureController {
         }
         replacementRecordId = null
         repository.save(records)
+        repository.clearDraft()
         mutableState.value = AppState(
             records = records,
             serviceConnected = GestureAccessibilityService.instance != null,
@@ -98,6 +103,7 @@ object GestureController {
 
     fun discardDraft() {
         replacementRecordId = null
+        repository.clearDraft()
         mutableState.value = mutableState.value.copy(
             engineState = EngineState.IDLE,
             draft = null,
@@ -120,13 +126,21 @@ object GestureController {
     }
 
     fun play(record: GestureRecord) {
+        if (record.gestures.isEmpty()) {
+            showMessage("该记录没有可执行操作")
+            return
+        }
+        if (record.gestures.any { it.kind == GestureKind.UNKNOWN }) {
+            showMessage("记录包含位置未知操作，无法安全执行")
+            return
+        }
         val service = GestureAccessibilityService.instance ?: run {
             showMessage("操作轨迹服务未运行")
             return
         }
         mutableState.value = mutableState.value.copy(
             engineState = EngineState.PLAYBACK_COUNTDOWN,
-            countdownMs = 3000L,
+            countdownMs = PLAYBACK_COUNTDOWN_MS,
             message = null
         )
         service.playAfterCountdown(record)
@@ -155,6 +169,18 @@ object GestureController {
         mutableState.value = mutableState.value.copy(message = message)
     }
 
+    fun abortActiveOperation(message: String) {
+        replacementRecordId = null
+        mutableState.value = mutableState.value.copy(
+            engineState = EngineState.IDLE,
+            draft = null,
+            countdownMs = null,
+            message = message
+        )
+    }
+
     fun currentOrientation(): Int = application.resources.configuration.orientation
         .takeIf { it != Configuration.ORIENTATION_UNDEFINED } ?: Configuration.ORIENTATION_PORTRAIT
+
+    private const val PLAYBACK_COUNTDOWN_MS = 1_000L
 }

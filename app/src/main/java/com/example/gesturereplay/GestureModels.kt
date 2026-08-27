@@ -18,8 +18,16 @@ data class RecordedGesture(
     val startOffsetMs: Long,
     val durationMs: Long,
     val samples: List<TouchSample>,
-    val direction: GestureDirection? = null
+    val direction: GestureDirection? = null,
+    val kind: GestureKind = GestureKind.TAP
 )
+
+enum class GestureKind {
+    TAP,
+    LONG_PRESS,
+    SWIPE,
+    UNKNOWN
+}
 
 enum class GestureDirection {
     LEFT,
@@ -121,7 +129,8 @@ internal fun List<MotionEvent>.toRecordedGesture(
         startOffsetMs = (gestureStart - recordingStartMs).coerceAtLeast(0L),
         durationMs = (last().eventTime - gestureStart).coerceAtLeast(1L),
         samples = samples,
-        direction = samples.toDirection()
+        direction = samples.toDirection(),
+        kind = samples.kindFor((last().eventTime - gestureStart).coerceAtLeast(1L))
     )
 }
 
@@ -142,6 +151,13 @@ internal fun List<TouchSample>.toDirection(): GestureDirection? {
 }
 
 private const val MIN_DIRECTION_DISTANCE_PX = 64f
+private const val LONG_PRESS_THRESHOLD_MS = 500L
+
+internal fun List<TouchSample>.kindFor(durationMs: Long): GestureKind = when {
+    toDirection() != null -> GestureKind.SWIPE
+    durationMs >= LONG_PRESS_THRESHOLD_MS -> GestureKind.LONG_PRESS
+    else -> GestureKind.TAP
+}
 
 internal fun GestureRecord.toJson(): JSONObject = JSONObject().apply {
     put("id", id)
@@ -154,10 +170,19 @@ internal fun GestureRecord.toJson(): JSONObject = JSONObject().apply {
     put("gestures", JSONArray().apply { gestures.forEach { put(it.toJson()) } })
 }
 
+internal fun RecordingDraft.toJson(): JSONObject = JSONObject().apply {
+    put("name", name)
+    put("screenWidth", screenWidth)
+    put("screenHeight", screenHeight)
+    put("orientation", orientation)
+    put("gestures", JSONArray().apply { gestures.forEach { put(it.toJson()) } })
+}
+
 private fun RecordedGesture.toJson(): JSONObject = JSONObject().apply {
     put("startOffsetMs", startOffsetMs)
     put("durationMs", durationMs)
     put("direction", direction?.name)
+    put("kind", kind.name)
     put("samples", JSONArray().apply {
         samples.forEach { sample ->
             put(JSONObject().apply {
@@ -182,25 +207,74 @@ internal fun JSONObject.toGestureRecord(): GestureRecord = GestureRecord(
     orientation = getInt("orientation"),
     totalDurationMs = getLong("totalDurationMs"),
     gestures = getJSONArray("gestures").mapObjects { gesture ->
+        val durationMs = gesture.getLong("durationMs")
+        val direction = if (gesture.has("direction") && !gesture.isNull("direction")) {
+            runCatching { GestureDirection.valueOf(gesture.getString("direction")) }.getOrNull()
+        } else {
+            null
+        }
+        val samples = gesture.getJSONArray("samples").mapObjects { sample ->
+            TouchSample(
+                pointerId = sample.getInt("pointerId"),
+                action = sample.getInt("action"),
+                x = sample.getDouble("x").toFloat(),
+                y = sample.getDouble("y").toFloat(),
+                xRatio = sample.getDouble("xRatio").toFloat(),
+                yRatio = sample.getDouble("yRatio").toFloat(),
+                offsetMs = sample.getLong("offsetMs")
+            )
+        }
         RecordedGesture(
             startOffsetMs = gesture.getLong("startOffsetMs"),
-            durationMs = gesture.getLong("durationMs"),
-            direction = if (gesture.has("direction") && !gesture.isNull("direction")) {
-                runCatching { GestureDirection.valueOf(gesture.getString("direction")) }.getOrNull()
+            durationMs = durationMs,
+            direction = direction,
+            kind = if (gesture.has("kind") && !gesture.isNull("kind")) {
+                runCatching { GestureKind.valueOf(gesture.getString("kind")) }.getOrElse {
+                    samples.kindFor(durationMs)
+                }
             } else {
-                null
+                samples.kindFor(durationMs)
             },
-            samples = gesture.getJSONArray("samples").mapObjects { sample ->
-                TouchSample(
-                    pointerId = sample.getInt("pointerId"),
-                    action = sample.getInt("action"),
-                    x = sample.getDouble("x").toFloat(),
-                    y = sample.getDouble("y").toFloat(),
-                    xRatio = sample.getDouble("xRatio").toFloat(),
-                    yRatio = sample.getDouble("yRatio").toFloat(),
-                    offsetMs = sample.getLong("offsetMs")
-                )
-            }
+            samples = samples
+        )
+    }
+)
+
+internal fun JSONObject.toRecordingDraft(): RecordingDraft = RecordingDraft(
+    name = getString("name"),
+    screenWidth = getInt("screenWidth"),
+    screenHeight = getInt("screenHeight"),
+    orientation = getInt("orientation"),
+    gestures = getJSONArray("gestures").mapObjects { gesture ->
+        val durationMs = gesture.getLong("durationMs")
+        val direction = if (gesture.has("direction") && !gesture.isNull("direction")) {
+            runCatching { GestureDirection.valueOf(gesture.getString("direction")) }.getOrNull()
+        } else {
+            null
+        }
+        val samples = gesture.getJSONArray("samples").mapObjects { sample ->
+            TouchSample(
+                pointerId = sample.getInt("pointerId"),
+                action = sample.getInt("action"),
+                x = sample.getDouble("x").toFloat(),
+                y = sample.getDouble("y").toFloat(),
+                xRatio = sample.getDouble("xRatio").toFloat(),
+                yRatio = sample.getDouble("yRatio").toFloat(),
+                offsetMs = sample.getLong("offsetMs")
+            )
+        }
+        RecordedGesture(
+            startOffsetMs = gesture.getLong("startOffsetMs"),
+            durationMs = durationMs,
+            direction = direction,
+            kind = if (gesture.has("kind") && !gesture.isNull("kind")) {
+                runCatching { GestureKind.valueOf(gesture.getString("kind")) }.getOrElse {
+                    samples.kindFor(durationMs)
+                }
+            } else {
+                samples.kindFor(durationMs)
+            },
+            samples = samples
         )
     }
 )

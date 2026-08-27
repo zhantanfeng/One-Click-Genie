@@ -48,7 +48,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import kotlin.math.hypot
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -393,17 +392,11 @@ private fun RecordDetail(
 private fun GestureSummary(index: Int, gesture: RecordedGesture) {
     val samples = gesture.samples
     val first = samples.firstOrNull()
-    val last = samples.lastOrNull()
-    val distance = if (first != null && last != null) hypot(
-        (last.x - first.x).toDouble(),
-        (last.y - first.y).toDouble()
-    ) else 0.0
-    val type = when {
-        samples.map { it.pointerId }.distinct().size > 1 -> "多指"
-        gesture.direction != null -> directionLabel(gesture.direction)
-        distance > 64 -> "滑动"
-        gesture.durationMs >= 500 -> "长按"
-        else -> "点击"
+    val type = when (gesture.kind) {
+        GestureKind.TAP -> "点击"
+        GestureKind.LONG_PRESS -> "长按"
+        GestureKind.SWIPE -> gesture.direction?.let(::directionLabel) ?: "滑动"
+        GestureKind.UNKNOWN -> "未知操作"
     }
     Surface(
         color = Color.White,
@@ -415,7 +408,9 @@ private fun GestureSummary(index: Int, gesture: RecordedGesture) {
             Column(modifier = Modifier.padding(start = 14.dp)) {
                 Text(type, color = Ink, fontWeight = FontWeight.Medium)
                 Text(
-                    text = if (first == null) {
+                    text = if (gesture.kind == GestureKind.UNKNOWN) {
+                        "未获得可回放的位置"
+                    } else if (first == null) {
                         formatDuration(gesture.durationMs)
                     } else {
                         "(${first.x.toInt()}, ${first.y.toInt()}) · ${formatDuration(gesture.durationMs)}"

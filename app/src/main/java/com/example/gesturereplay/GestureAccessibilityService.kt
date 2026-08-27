@@ -3,6 +3,7 @@ package com.example.gesturereplay
 import android.accessibilityservice.AccessibilityGestureEvent
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.accessibilityservice.TouchInteractionController
 import android.graphics.Color
 import android.graphics.Path
 import android.graphics.PixelFormat
@@ -18,10 +19,12 @@ import android.view.MotionEvent
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.widget.TextView
+import java.util.concurrent.Executor
 import kotlin.math.max
 
 class GestureAccessibilityService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
+    private val mainExecutor = Executor { command -> handler.post(command) }
     private val recordedGestures = mutableListOf<RecordedGesture>()
     private var recordingName = ""
     private var recordingStartMs = 0L
@@ -32,7 +35,11 @@ class GestureAccessibilityService : AccessibilityService() {
     private var recordingInputReadyAtMs = 0L
     private var receivedFirstGesture = false
     private var overlay: TextView? = null
-    private var pendingHomeAction: Runnable? = nul
+    private var pendingHomeAction: Runnable? = null
+    private var touchController: TouchInteractionController? = null
+    private var activeInteraction: InteractionSession? = null
+    private var interactionFinalizer: Runnable? = null
+    private var nextInteractionId = 0L
     private val removePlaybackResultRunnable = Runnable { removeOverlay() }
 
     private val finishRecordingRunnable = Runnable { finishRecording() }
@@ -47,37 +54,66 @@ class GestureAccessibilityService : AccessibilityService() {
         }
     }
     private var lastGestureFinishedAt = 0L
-    private var lastRawGestureEventTime = Long.MIN_VALUE
-    private var lastSemanticScrollEventTime = Long.MIN_VALUE
-    private var lastSemanticScrollDirection: GestureDirection? = null
-    private var lastSemanticClickEventTime = Long.MIN_VALUE
-    private var lastClickPoint: Pair<Float, Float>? = null
+    private data class SemanticCandidate(
+        val kind: GestureKind,
+        val eventTime: Long,
+        val point: Pair<Float, Float>? = null,
+        val direction: GestureDirection? = null,
+        val durationMs: Long = 40L
+    )
+
+    private data class InteractionSession(
+        val id: Long,
+        val startTime: Long,
+        var endTime: Long? = null,
+        var rawRecorded: Boolean = false,
+        var semanticClick: SemanticCandidate? = null,
+        var semanticScroll: SemanticCandidate? = null
+    )
+
+    private val touchCallback = object : TouchInteractionController.Callback {
+        override fun onMotionEvent(event: MotionEvent) {
+            if (event.actionMasked != MotionEvent.ACTION_DOWN) return
+            if (recording) startNewInteraction(event.eventTime)
+            // Release the same interaction to the foreground app unchanged.
+            touchController?.requestDelegating()
+        }
+
+        override fun onStateChanged(state: Int) {
+            if (recording && state == TouchInteractionController.STATE_CLEAR) {
+                endInteraction(SystemClock.uptimeMillis())
+            }
+        }
+    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
+        runCatching {
+            getTouchInteractionController(0).also { controller ->
+                controller.registerCallback(mainExecutor, touchCallback)
+                touchController = controller
+            }
+        }.onFailure { error ->
+            Log.e(TAG, "Unable to register touch interaction controller", error)
+        }
         GestureController.onServiceConnected(true)
         Log.i(TAG, "Accessibility service connected")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        val eventPackageName = event?.packageName?.toString()
         if (!recording || event == null || event.eventTime < recordingStartMs) return
         if (event.packageName?.toString() == packageName) return
 
         Log.d(
             TAG,
             "event type=${event.eventType} time=${event.eventTime} " +
-                "pkg=${eventPackageName ?: "?"} source=${event.source != null}"
+                "pkg=${event.packageName ?: "?"} source=${event.source != null}"
         )
 
         when (event.eventType) {
-            AccessibilityEvent.TYPE_TOUCH_INTERACTION_START -> {
-                markInteractionStarted()
-            }
-            AccessibilityEvent.TYPE_TOUCH_INTERACTION_END -> {
-                markInteractionFinished()
-            }
+            AccessibilityEvent.TYPE_TOUCH_INTERACTION_START -> startNewInteraction(event.eventTime)
+            AccessibilityEvent.TYPE_TOUCH_INTERACTION_END -> endInteraction(event.eventTime)
             AccessibilityEvent.TYPE_VIEW_CLICKED,
             AccessibilityEvent.TYPE_VIEW_LONG_CLICKED -> recordSemanticClick(event)
             AccessibilityEvent.TYPE_VIEW_SCROLLED -> recordSemanticScroll(event)
@@ -89,6 +125,8 @@ class GestureAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         stopTimers()
         removeOverlay()
+        touchController?.unregisterCallback(touchCallback)
+        touchController = null
         if (instance === this) instance = null
         GestureController.onServiceConnected(false)
         super.onDestroy()
@@ -118,8 +156,7 @@ class GestureAccessibilityService : AccessibilityService() {
         recordingOrientation = GestureController.currentOrientation()
         recordingStartMs = SystemClock.uptimeMillis()
         recordingInputReadyAtMs = recordingStartMs
-        lastRawGestureEventTime = Long.MIN_VALUE
-        lastClickPoint = null
+        activeInteraction = null
         recording = true
         receivedFirstGesture = false
         showOverlay("正在记录 · 等待首次操作")
@@ -129,71 +166,49 @@ class GestureAccessibilityService : AccessibilityService() {
     private fun recordGesture(events: List<MotionEvent>) {
         if (!recording) return
         if (events.first().downTime < recordingInputReadyAtMs) return
+        val session = beginInteraction(events.first().downTime)
         val gesture = events.toRecordedGesture(
             recordingStartMs = recordingStartMs,
             screenWidth = recordingWidth,
             screenHeight = recordingHeight
         )
-        markInteractionStarted()
-        if (gesture.samples.isNotEmpty()) recordedGestures += gesture
-        lastRawGestureEventTime = events.last().eventTime
+        if (gesture.samples.isEmpty() || session.rawRecorded) return
+        session.rawRecorded = true
+        recordedGestures += gesture
         Log.d(TAG, "Gesture captured: samples=${gesture.samples.size}, duration=${gesture.durationMs}ms")
-        markInteractionFinished()
+        if (session.endTime == null) endInteraction(events.last().eventTime)
     }
 
     private fun recordSemanticClick(event: AccessibilityEvent) {
-        lastSemanticClickEventTime = event.eventTime
-        if (shouldIgnoreSemanticEvent(event.eventTime)) return
+        val session = beginInteraction(event.eventTime)
+        if (session.rawRecorded) return
         val bounds = Rect()
-        val node = event.source ?: findFallbackClickNode(event)
+        val node = event.source
         val point = if (node != null) {
             node.getBoundsInScreen(bounds)
             if (!bounds.isEmpty) bounds.exactCenterX() to bounds.exactCenterY() else null
         } else {
             null
         }
-        val (x, y) = point ?: lastClickPoint ?: (recordingWidth / 2f to recordingHeight / 2f)
-        lastClickPoint = x to y
-        val duration = if (event.eventType == AccessibilityEvent.TYPE_VIEW_LONG_CLICKED) 600L else 40L
-        recordSyntheticGesture(
-            startMs = event.eventTime,
-            durationMs = duration,
-            points = listOf(x to y)
+        session.semanticClick = SemanticCandidate(
+            kind = if (event.eventType == AccessibilityEvent.TYPE_VIEW_LONG_CLICKED) {
+                GestureKind.LONG_PRESS
+            } else {
+                GestureKind.TAP
+            },
+            eventTime = event.eventTime,
+            point = point,
+            durationMs = if (event.eventType == AccessibilityEvent.TYPE_VIEW_LONG_CLICKED) {
+                LONG_PRESS_DURATION_MS
+            } else {
+                TAP_DURATION_MS
+            }
         )
     }
 
-    private fun findFallbackClickNode(event: AccessibilityEvent): android.view.accessibility.AccessibilityNodeInfo? {
-        val root = rootInActiveWindow ?: return null
-        val labels = event.text.map { it.toString() }.filter { it.isNotBlank() }
-        return findNode(root) { node ->
-            labels.any { label ->
-                node.text?.toString() == label || node.contentDescription?.toString() == label
-            }
-        } ?: findNode(root) { it.isFocused || it.isAccessibilityFocused }
-            ?: findNode(root) { it.isClickable && it.isVisibleToUser }
-    }
-
-    private fun findNode(
-        node: android.view.accessibility.AccessibilityNodeInfo,
-        predicate: (android.view.accessibility.AccessibilityNodeInfo) -> Boolean
-    ): android.view.accessibility.AccessibilityNodeInfo? {
-        if (predicate(node)) return node
-        for (index in 0 until node.childCount) {
-            val child = node.getChild(index) ?: continue
-            val found = findNode(child, predicate)
-            if (found != null) return found
-        }
-        return null
-    }
-
     private fun recordSemanticScroll(event: AccessibilityEvent) {
-        if (shouldIgnoreSemanticEvent(event.eventTime)) return
-        if (lastSemanticClickEventTime != Long.MIN_VALUE &&
-            kotlin.math.abs(event.eventTime - lastSemanticClickEventTime) <= CLICK_SCROLL_GRACE_MS
-        ) {
-            Log.d(TAG, "Ignoring scroll event adjacent to click")
-            return
-        }
+        val session = beginInteraction(event.eventTime)
+        if (session.rawRecorded || session.semanticClick != null) return
         if (!event.isScrollable) {
             Log.d(TAG, "Ignoring scroll event from non-scrollable source")
             return
@@ -221,44 +236,113 @@ class GestureAccessibilityService : AccessibilityService() {
         } else {
             if (direction < 0) GestureDirection.UP else GestureDirection.DOWN
         }
-        if (event.eventTime == lastSemanticScrollEventTime &&
-            gestureDirection == lastSemanticScrollDirection
-        ) {
-            Log.d(TAG, "Ignoring duplicate scroll event: $gestureDirection")
-            return
-        }
-        lastSemanticScrollEventTime = event.eventTime
-        lastSemanticScrollDirection = gestureDirection
-        val start = if (horizontalScroll) {
-            (centerX - direction * distance) to centerY
-        } else {
-            centerX to (centerY - direction * distance)
-        }
-        val end = if (horizontalScroll) {
-            (centerX + direction * distance) to centerY
-        } else {
-            centerX to (centerY + direction * distance)
-        }
-        recordSyntheticGesture(
-            startMs = event.eventTime,
-            durationMs = 280L,
-            points = listOf(start, end),
-            direction = gestureDirection
+        session.semanticScroll = SemanticCandidate(
+            kind = GestureKind.SWIPE,
+            eventTime = event.eventTime,
+            point = centerX to centerY,
+            direction = gestureDirection,
+            durationMs = SWIPE_DURATION_MS
         )
     }
 
-    private fun shouldIgnoreSemanticEvent(eventTime: Long): Boolean =
-        lastRawGestureEventTime != Long.MIN_VALUE &&
-            kotlin.math.abs(eventTime - lastRawGestureEventTime) <= RAW_GESTURE_GRACE_MS
+    private fun beginInteraction(eventTime: Long): InteractionSession {
+        val existing = activeInteraction
+        if (existing != null) return existing
+        return InteractionSession(
+            id = ++nextInteractionId,
+            startTime = eventTime
+        ).also {
+            activeInteraction = it
+            markInteractionStarted()
+        }
+    }
+
+    private fun startNewInteraction(eventTime: Long): InteractionSession {
+        val existing = activeInteraction
+        if (existing != null && existing.endTime != null) {
+            interactionFinalizer?.let(handler::removeCallbacks)
+            finalizeInteraction(existing.id)
+        }
+        return beginInteraction(eventTime)
+    }
+
+    private fun endInteraction(eventTime: Long) {
+        val session = activeInteraction ?: return
+        session.endTime = eventTime
+        interactionFinalizer?.let(handler::removeCallbacks)
+        val finalizer = Runnable { finalizeInteraction(session.id) }
+        interactionFinalizer = finalizer
+        handler.postDelayed(finalizer, SEMANTIC_SETTLE_MS)
+    }
+
+    private fun finalizeInteraction(interactionId: Long) {
+        val session = activeInteraction ?: return
+        if (session.id != interactionId) return
+        interactionFinalizer = null
+        if (!session.rawRecorded) {
+            when (val candidate = session.semanticClick ?: session.semanticScroll) {
+                null -> recordUnknownInteraction(session)
+                else -> recordSemanticCandidate(session, candidate)
+            }
+        }
+        activeInteraction = null
+        markInteractionFinished()
+    }
+
+    private fun recordSemanticCandidate(
+        session: InteractionSession,
+        candidate: SemanticCandidate
+    ) {
+        if (candidate.point == null) {
+            recordUnknownInteraction(session)
+            return
+        }
+        val points = if (candidate.kind == GestureKind.SWIPE && candidate.direction != null) {
+            swipePoints(candidate.point, candidate.direction)
+        } else {
+            listOf(candidate.point)
+        }
+        recordSyntheticGesture(
+            startMs = candidate.eventTime,
+            durationMs = candidate.durationMs,
+            points = points,
+            direction = candidate.direction,
+            kind = candidate.kind
+        )
+    }
+
+    private fun swipePoints(
+        center: Pair<Float, Float>,
+        direction: GestureDirection
+    ): List<Pair<Float, Float>> {
+        val distance = minOf(recordingWidth, recordingHeight) * SWIPE_DISTANCE_RATIO
+        val (centerX, centerY) = center
+        return when (direction) {
+            GestureDirection.LEFT -> listOf((centerX + distance / 2) to centerY, (centerX - distance / 2) to centerY)
+            GestureDirection.RIGHT -> listOf((centerX - distance / 2) to centerY, (centerX + distance / 2) to centerY)
+            GestureDirection.UP -> listOf(centerX to (centerY + distance / 2), centerX to (centerY - distance / 2))
+            GestureDirection.DOWN -> listOf(centerX to (centerY - distance / 2), centerX to (centerY + distance / 2))
+        }
+    }
+
+    private fun recordUnknownInteraction(session: InteractionSession) {
+        recordedGestures += RecordedGesture(
+            startOffsetMs = (session.startTime - recordingStartMs).coerceAtLeast(0L),
+            durationMs = ((session.endTime ?: session.startTime) - session.startTime).coerceAtLeast(1L),
+            samples = emptyList(),
+            kind = GestureKind.UNKNOWN
+        )
+        Log.w(TAG, "Recorded unknown interaction id=${session.id}")
+    }
 
     private fun recordSyntheticGesture(
         startMs: Long,
         durationMs: Long,
         points: List<Pair<Float, Float>>,
-        direction: GestureDirection? = null
+        direction: GestureDirection? = null,
+        kind: GestureKind
     ) {
         if (points.isEmpty()) return
-        markInteractionStarted()
         val samples = buildList {
             points.forEachIndexed { index, (x, y) ->
                 val offset = if (points.size == 1) 0L else durationMs * index / (points.size - 1)
@@ -297,9 +381,9 @@ class GestureAccessibilityService : AccessibilityService() {
             startOffsetMs = (startMs - recordingStartMs).coerceAtLeast(0L),
             durationMs = durationMs,
             samples = samples,
-            direction = direction ?: samples.toDirection()
+            direction = direction ?: samples.toDirection(),
+            kind = kind
         )
-        markInteractionFinished()
         Log.d(TAG, "Semantic gesture captured: points=${points.size}")
     }
 
@@ -410,6 +494,7 @@ class GestureAccessibilityService : AccessibilityService() {
     }
 
     private fun buildGesture(source: RecordedGesture): GestureDescription? {
+        if (source.kind == GestureKind.UNKNOWN) return null
         val bounds = currentScreenBounds()
         val width = bounds.first.toFloat()
         val height = bounds.second.toFloat()
@@ -492,6 +577,9 @@ class GestureAccessibilityService : AccessibilityService() {
         handler.removeCallbacks(finishRecordingRunnable)
         handler.removeCallbacks(countdownRunnable)
         handler.removeCallbacks(removePlaybackResultRunnable)
+        interactionFinalizer?.let(handler::removeCallbacks)
+        interactionFinalizer = null
+        activeInteraction = null
         pendingHomeAction?.let(handler::removeCallbacks)
         pendingHomeAction = null
     }
@@ -499,6 +587,8 @@ class GestureAccessibilityService : AccessibilityService() {
     private fun returnHomeThen(action: () -> Unit) {
         if (!performGlobalAction(GLOBAL_ACTION_HOME)) {
             Log.w(TAG, "Unable to perform HOME before gesture operation")
+            GestureController.abortActiveOperation("无法回到主屏幕")
+            return
         }
         val callback = Runnable {
             pendingHomeAction = null
@@ -518,10 +608,11 @@ class GestureAccessibilityService : AccessibilityService() {
         private const val PLAYBACK_COUNTDOWN_MS = 1_000L
         private const val PLAYBACK_RESULT_DISPLAY_MS = 1_500L
         private const val HOME_TRANSITION_DELAY_MS = 300L
-        // Only suppress a semantic event that is effectively the same dispatch.
-        // A wider window drops legitimate consecutive taps on fast UIs.
-        private const val RAW_GESTURE_GRACE_MS = 5L
-        private const val CLICK_SCROLL_GRACE_MS = 250L
         private const val MIN_SCROLL_DELTA_PX = 16
+        private const val TAP_DURATION_MS = 40L
+        private const val LONG_PRESS_DURATION_MS = 600L
+        private const val SWIPE_DURATION_MS = 280L
+        private const val SWIPE_DISTANCE_RATIO = 0.35f
+        private const val SEMANTIC_SETTLE_MS = 180L
     }
 }
