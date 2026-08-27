@@ -401,7 +401,7 @@ private fun GestureSummary(index: Int, gesture: RecordedGesture) {
     val type = when {
         samples.map { it.pointerId }.distinct().size > 1 -> "多指"
         gesture.direction != null -> directionLabel(gesture.direction)
-        distance > 24 -> "滑动"
+        distance > 64 -> "滑动"
         gesture.durationMs >= 500 -> "长按"
         else -> "点击"
     }

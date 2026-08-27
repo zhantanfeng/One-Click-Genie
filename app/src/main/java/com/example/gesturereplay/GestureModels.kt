@@ -131,13 +131,17 @@ internal fun List<TouchSample>.toDirection(): GestureDirection? {
     val last = last()
     val dx = last.x - first.x
     val dy = last.y - first.y
-    if (kotlin.math.abs(dx) < 24f && kotlin.math.abs(dy) < 24f) return null
+    if (kotlin.math.abs(dx) < MIN_DIRECTION_DISTANCE_PX &&
+        kotlin.math.abs(dy) < MIN_DIRECTION_DISTANCE_PX
+    ) return null
     return if (kotlin.math.abs(dx) >= kotlin.math.abs(dy)) {
         if (dx < 0) GestureDirection.LEFT else GestureDirection.RIGHT
     } else {
         if (dy < 0) GestureDirection.UP else GestureDirection.DOWN
     }
 }
+
+private const val MIN_DIRECTION_DISTANCE_PX = 64f
 
 internal fun GestureRecord.toJson(): JSONObject = JSONObject().apply {
     put("id", id)
