@@ -135,14 +135,20 @@ internal fun List<MotionEvent>.toRecordedGesture(
 }
 
 internal fun List<TouchSample>.toDirection(): GestureDirection? {
-    if (size < 2) return null
-    val first = first()
-    val last = last()
+    val path = primaryPointerPath()
+    if (path.size < 2) return null
+    val first = path.first()
+    val last = path.last()
     val dx = last.x - first.x
     val dy = last.y - first.y
-    if (kotlin.math.abs(dx) < MIN_DIRECTION_DISTANCE_PX &&
-        kotlin.math.abs(dy) < MIN_DIRECTION_DISTANCE_PX
-    ) return null
+    val displacement = kotlin.math.sqrt(dx * dx + dy * dy)
+    if (displacement < MIN_DIRECTION_DISTANCE_PX) return null
+    // A real swipe travels mostly one way: net displacement should be a large
+    // fraction of the total travelled distance. A tap or long press whose finger
+    // wanders around has a low displacement-to-path ratio and must not be
+    // classified as a swipe.
+    val travelled = path.totalTravelledDistance()
+    if (travelled <= 0f || displacement / travelled < MIN_SWIPE_PATH_EFFICIENCY) return null
     return if (kotlin.math.abs(dx) >= kotlin.math.abs(dy)) {
         if (dx < 0) GestureDirection.LEFT else GestureDirection.RIGHT
     } else {
@@ -150,7 +156,31 @@ internal fun List<TouchSample>.toDirection(): GestureDirection? {
     }
 }
 
-private const val MIN_DIRECTION_DISTANCE_PX = 64f
+/**
+ * Samples of the pointer that touched down first, in chronological order.
+ * Using only this pointer avoids comparing the down point of one finger with
+ * the up point of another finger in multi-touch gestures.
+ */
+private fun List<TouchSample>.primaryPointerPath(): List<TouchSample> {
+    val pointerId = firstOrNull()?.pointerId ?: return emptyList()
+    return asSequence()
+        .filter { it.pointerId == pointerId }
+        .sortedBy { it.offsetMs }
+        .toList()
+}
+
+private fun List<TouchSample>.totalTravelledDistance(): Float {
+    var total = 0f
+    for (index in 1 until size) {
+        val dx = this[index].x - this[index - 1].x
+        val dy = this[index].y - this[index - 1].y
+        total += kotlin.math.sqrt(dx * dx + dy * dy)
+    }
+    return total
+}
+
+private const val MIN_DIRECTION_DISTANCE_PX = 120f
+private const val MIN_SWIPE_PATH_EFFICIENCY = 0.45f
 private const val LONG_PRESS_THRESHOLD_MS = 500L
 
 internal fun List<TouchSample>.kindFor(durationMs: Long): GestureKind = when {
